@@ -90,9 +90,50 @@ Rows listing several CVEs in one cell are **expanded into one record per CVE**, 
 
 **`triage_summary_*.csv`** — one row per CVE, with affected-asset count and worst-case priority. Drives planning.
 
+**`triage_changes_*.csv`** — written only when `-CompareWith` is used. See [Trend](#trend-what-changed-since-last-run).
+
 Both carry: `Priority`, `OnCisaKev`, `KevDueDate`, `KevOverdue`, `KnownRansomware`, `EpssScore`, `EpssPercentile`.
 
 `KevOverdue` compares today against CISA's mandated remediation date — useful even outside federal BOD 22-01 scope, since it's a defensible externally-set deadline.
+
+---
+
+## Trend: what changed since last run
+
+Pass `-CompareWith latest` to diff against the most recent summary in `-OutDir` (or give an explicit path):
+
+```powershell
+./Invoke-VulnTriage.ps1 -InputCsv ./export.csv -CompareWith latest
+```
+
+```
+  ** 1 vulnerability(ies) newly added to CISA KEV **
+     CVE-2014-0160  P1-Watch -> P1
+
+  Change summary:
+    Escalated     2
+
+Change    Cve           PreviousPriority CurrentPriority AssetDelta Detail
+------    ---           ---------------- --------------- ---------- ------
+Escalated CVE-2014-0160 P1-Watch         P1                       0 Added to CISA KEV. P1-Watch -> P1
+Escalated CVE-2022-3786 P2               P1-Watch                 0 P2 -> P1-Watch. EPSS +0.9039
+```
+
+That output is from two real runs, and it's the clearest demonstration of why both feeds matter: **EPSS flagged `CVE-2014-0160` as P1-Watch before CISA added it to KEV.** A KEV-only process would have picked it up at escalation time; a CVSS-only process would still have it sitting among the Highs.
+
+| Classification | Meaning |
+|----------------|---------|
+| `NewlyKev` | **Headline signal.** Already in your backlog; CISA has now confirmed in-the-wild exploitation. |
+| `Escalated` | Priority got worse between runs. |
+| `New` | Not present in the previous run. |
+| `Resolved` | Gone — remediated, or out of scope. |
+| `De-escalated` | Priority improved. |
+| `EpssSpike` | EPSS rose by ≥ `-EpssDelta` (default 0.10). |
+| `AssetDelta` | Net change in affected assets — catches lateral spread at a steady priority. |
+
+Only changed items are reported; add `-IncludeUnchanged` for the full set. Results are written to `triage_changes_*.csv` and sorted with newly-KEV items first.
+
+Because the diff is just two summary files, it works across any interval — nightly, weekly, or per maintenance window — with no database or server.
 
 ---
 
@@ -115,7 +156,7 @@ If the EPSS API is unreachable mid-run, the tool warns and continues — KEV mem
 Invoke-Pester -Path ./tests
 ```
 
-39 tests, fully offline via `tests/fixtures`. Covers CVE parsing (delimiters, casing, malformed input), column resolution, priority boundaries, multi-CVE expansion, due-date math, and summary rollup.
+54 tests, fully offline via `tests/fixtures`. Covers CVE parsing (delimiters, casing, malformed input), column resolution, priority boundaries, multi-CVE expansion, due-date math, summary rollup, and run-to-run diffing — including the string coercion needed when a previous run is re-read from CSV.
 
 ---
 
@@ -140,6 +181,7 @@ Get-TriagePriority -OnKev $false -EpssScore $epss['CVE-2022-3786'].Score -Severi
 | `Get-TriagePriority` | The ranking rule, in isolation |
 | `Invoke-VulnTriage` | Enrich + prioritize |
 | `Get-TriageSummary` | Roll up per CVE |
+| `Compare-TriageRun` | Diff two runs; surface newly-KEV and escalations |
 
 ### Adding a scanner adapter
 
@@ -156,7 +198,7 @@ Invoke-VulnTriage -Finding $findings -ColumnMap @{ Cve = 'cve'; Asset = 'host' }
 
 - [ ] Scanner adapters (Tenable, Qualys, Defender) behind a common interface
 - [ ] Optional XLSX output via `ImportExcel`
-- [ ] Trend tracking — diff successive runs to show what's new, fixed, or newly KEV-listed
+- [x] Trend tracking — diff successive runs to show what's new, fixed, or newly KEV-listed
 - [ ] Container/SBOM input (CycloneDX, SPDX)
 
 ---

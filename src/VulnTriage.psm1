@@ -308,5 +308,196 @@ function Get-TriageSummary {
         Sort-Object @{ Expression = { $rank[$_.Priority] } }, @{ Expression = 'MaxEpssScore'; Descending = $true }
 }
 
+function Get-PropertyOrDefault {
+    [CmdletBinding()]
+    param([object]$InputObject, [string]$Name, $Default = $null)
+
+    if ($null -ne $InputObject -and $InputObject.PSObject.Properties[$Name]) {
+        $InputObject.$Name
+    } else {
+        $Default
+    }
+}
+
+function ConvertTo-TriageBoolean {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][object]$Value)
+
+    if ($Value -is [bool]) { return $Value }
+    if ($null -eq $Value)  { return $false }
+    ([string]$Value) -iin @('true', '1', 'yes')
+}
+
+function ConvertTo-TriageDouble {
+    [CmdletBinding()]
+    [OutputType([double])]
+    param([AllowNull()][object]$Value)
+
+    [double]$parsed = 0.0
+    if ($null -ne $Value -and [double]::TryParse([string]$Value,
+            [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        return $parsed
+    }
+    0.0
+}
+
+function ConvertTo-NormalizedSummary {
+<#
+.SYNOPSIS
+    Coerces summary rows into a uniform shape keyed for comparison.
+.DESCRIPTION
+    A previous run is normally re-read from CSV, where every value is a string,
+    while the current run is live objects. Normalizing both sides lets the diff
+    compare like with like instead of 'True' against $true.
+#>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Row)
+
+    $map = @{}
+    foreach ($r in $Row) {
+        $cve = [string](Get-PropertyOrDefault $r 'Cve')
+        $fnd = [string](Get-PropertyOrDefault $r 'Finding')
+        $key = if (-not [string]::IsNullOrWhiteSpace($cve)) { $cve.ToUpperInvariant() } else { "FINDING::$fnd" }
+
+        $map[$key] = [pscustomobject]@{
+            Key             = $key
+            Cve             = $cve
+            Finding         = $fnd
+            Severity        = [string](Get-PropertyOrDefault $r 'Severity')
+            Priority        = [string](Get-PropertyOrDefault $r 'Priority' 'P3')
+            OnCisaKev       = ConvertTo-TriageBoolean (Get-PropertyOrDefault $r 'OnCisaKev')
+            KevOverdue      = ConvertTo-TriageBoolean (Get-PropertyOrDefault $r 'KevOverdue')
+            KnownRansomware = ConvertTo-TriageBoolean (Get-PropertyOrDefault $r 'KnownRansomware')
+            MaxEpssScore    = ConvertTo-TriageDouble  (Get-PropertyOrDefault $r 'MaxEpssScore')
+            AssetCount      = [int](ConvertTo-TriageDouble (Get-PropertyOrDefault $r 'AssetCount'))
+        }
+    }
+    $map
+}
+
+function Compare-TriageRun {
+<#
+.SYNOPSIS
+    Diffs two triage summaries to show what changed between runs.
+.DESCRIPTION
+    Answers the question a recurring review meeting actually opens with: what is
+    new, what got worse, and what did we actually fix since last time?
+
+    The headline signal is NewlyKev — a CVE you already knew about that CISA has
+    since confirmed as exploited in the wild. It was in your backlog yesterday at
+    a routine priority; today it is a known-exploited vulnerability on your estate.
+
+    Each item gets one primary Change classification by precedence
+    (New > Resolved > Escalated > De-escalated > Unchanged) plus independent
+    NewlyKev / EpssSpike flags, since a single item can be several things at once.
+
+.PARAMETER Previous
+    Summary rows from the earlier run (live objects or Import-Csv output).
+
+.PARAMETER Current
+    Summary rows from this run.
+
+.PARAMETER EpssDelta
+    Absolute EPSS increase that counts as a spike worth surfacing.
+
+.PARAMETER IncludeUnchanged
+    Emit untouched items too, rather than only what moved.
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Previous,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Current,
+        [ValidateRange(0.0, 1.0)][double]$EpssDelta = 0.1,
+        [switch]$IncludeUnchanged
+    )
+
+    $rank = @{ 'P1' = 0; 'P1-Watch' = 1; 'P2' = 2; 'P3' = 3 }
+    $prev = ConvertTo-NormalizedSummary -Row $Previous
+    $curr = ConvertTo-NormalizedSummary -Row $Current
+
+    $changes = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($key in $curr.Keys) {
+        $c = $curr[$key]
+        $p = if ($prev.ContainsKey($key)) { $prev[$key] } else { $null }
+
+        $newlyKev  = $c.OnCisaKev -and $p -and -not $p.OnCisaKev
+        $epssSpike = $p -and (($c.MaxEpssScore - $p.MaxEpssScore) -ge $EpssDelta)
+
+        $prevRank = if ($p) { $rank[$p.Priority] } else { $null }
+        $currRank = $rank[$c.Priority]
+
+        $change =
+            if (-not $p)                        { 'New' }
+            elseif ($currRank -lt $prevRank)    { 'Escalated' }
+            elseif ($currRank -gt $prevRank)    { 'De-escalated' }
+            else                                { 'Unchanged' }
+
+        if ($change -eq 'Unchanged' -and -not $IncludeUnchanged -and
+            -not $newlyKev -and -not $epssSpike -and
+            $c.AssetCount -eq $(if ($p) { $p.AssetCount } else { 0 })) { continue }
+
+        $detail = switch ($change) {
+            'New'          { "First seen at $($c.Priority)" }
+            'Escalated'    { "$($p.Priority) -> $($c.Priority)" }
+            'De-escalated' { "$($p.Priority) -> $($c.Priority)" }
+            default        { 'Priority unchanged' }
+        }
+        if ($newlyKev)  { $detail = "Added to CISA KEV. $detail" }
+        if ($epssSpike) { $detail = "$detail. EPSS +$([math]::Round($c.MaxEpssScore - $p.MaxEpssScore, 4))" }
+
+        $changes.Add([pscustomobject]@{
+            Change           = $change
+            Cve              = $c.Cve
+            Finding          = $c.Finding
+            Severity         = $c.Severity
+            NewlyKev         = $newlyKev
+            EpssSpike        = $epssSpike
+            PreviousPriority = if ($p) { $p.Priority } else { $null }
+            CurrentPriority  = $c.Priority
+            PreviousEpss     = if ($p) { $p.MaxEpssScore } else { $null }
+            CurrentEpss      = $c.MaxEpssScore
+            PreviousAssets   = if ($p) { $p.AssetCount } else { 0 }
+            CurrentAssets    = $c.AssetCount
+            AssetDelta       = $c.AssetCount - $(if ($p) { $p.AssetCount } else { 0 })
+            KnownRansomware  = $c.KnownRansomware
+            Detail           = $detail
+        })
+    }
+
+    foreach ($key in $prev.Keys) {
+        if ($curr.ContainsKey($key)) { continue }
+        $p = $prev[$key]
+        $changes.Add([pscustomobject]@{
+            Change           = 'Resolved'
+            Cve              = $p.Cve
+            Finding          = $p.Finding
+            Severity         = $p.Severity
+            NewlyKev         = $false
+            EpssSpike        = $false
+            PreviousPriority = $p.Priority
+            CurrentPriority  = $null
+            PreviousEpss     = $p.MaxEpssScore
+            CurrentEpss      = $null
+            PreviousAssets   = $p.AssetCount
+            CurrentAssets    = 0
+            AssetDelta       = -$p.AssetCount
+            KnownRansomware  = $p.KnownRansomware
+            Detail           = "No longer present (was $($p.Priority) on $($p.AssetCount) asset(s))"
+        })
+    }
+
+    # Most actionable first: newly-exploited, then worsening, then new, then wins.
+    $order = @{ 'Escalated' = 1; 'New' = 2; 'De-escalated' = 3; 'Resolved' = 4; 'Unchanged' = 5 }
+    $changes | Sort-Object `
+        @{ Expression = { if ($_.NewlyKev) { 0 } else { 1 } } },
+        @{ Expression = { $order[$_.Change] } },
+        @{ Expression = 'CurrentEpss'; Descending = $true }
+}
+
 Export-ModuleMember -Function Resolve-ColumnMap, Get-CveFromText, Get-KevCatalog,
-                              Get-EpssScore, Get-TriagePriority, Invoke-VulnTriage, Get-TriageSummary
+                              Get-EpssScore, Get-TriagePriority, Invoke-VulnTriage,
+                              Get-TriageSummary, Compare-TriageRun

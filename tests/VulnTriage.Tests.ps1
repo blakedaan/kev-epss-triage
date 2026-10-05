@@ -195,6 +195,127 @@ Describe 'Invoke-VulnTriage' {
     }
 }
 
+Describe 'Compare-TriageRun' {
+    BeforeAll {
+        # Minimal summary-shaped rows; only the compared fields matter.
+        function script:New-Row {
+            param($Cve, $Priority, $Epss = 0.0, $Kev = $false, $Assets = 1, $Finding = 'Test finding', $Ransom = $false)
+            [pscustomobject]@{
+                Cve = $Cve; Finding = $Finding; Severity = 'High'; Priority = $Priority
+                OnCisaKev = $Kev; KevOverdue = $false; KnownRansomware = $Ransom
+                MaxEpssScore = $Epss; AssetCount = $Assets
+            }
+        }
+    }
+
+    It 'reports a vulnerability absent from the previous run as New' {
+        $c = @(Compare-TriageRun -Previous @() -Current @(New-Row 'CVE-2021-44228' 'P1' 0.97 $true))
+        $c.Count            | Should -Be 1
+        $c[0].Change        | Should -Be 'New'
+        $c[0].PreviousPriority | Should -BeNullOrEmpty
+    }
+
+    It 'reports a vulnerability missing from the current run as Resolved' {
+        $c = @(Compare-TriageRun -Previous @(New-Row 'CVE-2017-0144' 'P1' 0.97 $true) -Current @())
+        $c.Count         | Should -Be 1
+        $c[0].Change     | Should -Be 'Resolved'
+        $c[0].AssetDelta | Should -Be -1
+    }
+
+    It 'flags a CVE newly added to CISA KEV' {
+        $prev = @(New-Row 'CVE-2022-3786' 'P2' 0.02 $false)
+        $curr = @(New-Row 'CVE-2022-3786' 'P1' 0.92 $true)
+        $c = @(Compare-TriageRun -Previous $prev -Current $curr)
+        $c[0].NewlyKev | Should -BeTrue
+        $c[0].Change   | Should -Be 'Escalated'
+        $c[0].Detail   | Should -BeLike 'Added to CISA KEV*'
+    }
+
+    It 'does not flag NewlyKev for a CVE that was already on KEV' {
+        $prev = @(New-Row 'CVE-2021-44228' 'P1' 0.97 $true)
+        $curr = @(New-Row 'CVE-2021-44228' 'P1' 0.97 $true -Assets 2)
+        (@(Compare-TriageRun -Previous $prev -Current $curr))[0].NewlyKev | Should -BeFalse
+    }
+
+    It 'detects priority escalation and de-escalation' {
+        $up = @(Compare-TriageRun -Previous @(New-Row 'CVE-1' 'P3') -Current @(New-Row 'CVE-1' 'P1-Watch'))
+        $up[0].Change | Should -Be 'Escalated'
+
+        $down = @(Compare-TriageRun -Previous @(New-Row 'CVE-1' 'P1-Watch') -Current @(New-Row 'CVE-1' 'P3'))
+        $down[0].Change | Should -Be 'De-escalated'
+    }
+
+    It 'flags a material EPSS rise as a spike' {
+        $c = @(Compare-TriageRun -Previous @(New-Row 'CVE-1' 'P2' 0.10) -Current @(New-Row 'CVE-1' 'P2' 0.45))
+        $c[0].EpssSpike | Should -BeTrue
+        $c[0].Detail    | Should -BeLike '*EPSS +0.35*'
+    }
+
+    It 'ignores an EPSS rise below the delta' {
+        $c = @(Compare-TriageRun -Previous @(New-Row 'CVE-1' 'P2' 0.10) -Current @(New-Row 'CVE-1' 'P2' 0.12))
+        $c.Count | Should -Be 0
+    }
+
+    It 'honours a custom EPSS delta' {
+        $c = @(Compare-TriageRun -Previous @(New-Row 'CVE-1' 'P2' 0.10) `
+                                 -Current  @(New-Row 'CVE-1' 'P2' 0.12) -EpssDelta 0.01)
+        $c[0].EpssSpike | Should -BeTrue
+    }
+
+    It 'omits unchanged items by default but includes them on request' {
+        $row = New-Row 'CVE-1' 'P2' 0.10
+        @(Compare-TriageRun -Previous @($row) -Current @($row)).Count | Should -Be 0
+        @(Compare-TriageRun -Previous @($row) -Current @($row) -IncludeUnchanged).Count | Should -Be 1
+    }
+
+    It 'reports asset spread even when the priority holds' {
+        $c = @(Compare-TriageRun -Previous @(New-Row 'CVE-1' 'P2' 0.1 $false 1) `
+                                 -Current  @(New-Row 'CVE-1' 'P2' 0.1 $false 5))
+        $c[0].Change     | Should -Be 'Unchanged'
+        $c[0].AssetDelta | Should -Be 4
+    }
+
+    It 'compares correctly against CSV-imported rows where values are strings' {
+        $path = Join-Path ([IO.Path]::GetTempPath()) "triage-prev-$([guid]::NewGuid()).csv"
+        try {
+            @(New-Row 'CVE-2022-3786' 'P2' 0.02 $false) | Export-Csv -LiteralPath $path -NoTypeInformation
+            $imported = @(Import-Csv -LiteralPath $path)
+            $imported[0].OnCisaKev | Should -BeOfType [string]   # confirms the coercion is real
+
+            $c = @(Compare-TriageRun -Previous $imported -Current @(New-Row 'CVE-2022-3786' 'P1' 0.92 $true))
+            $c[0].NewlyKev     | Should -BeTrue
+            $c[0].Change       | Should -Be 'Escalated'
+            $c[0].PreviousEpss | Should -Be 0.02
+        } finally {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'matches CVEs case-insensitively across runs' {
+        $c = @(Compare-TriageRun -Previous @(New-Row 'cve-2021-44228' 'P1' 0.97 $true) `
+                                 -Current  @(New-Row 'CVE-2021-44228' 'P1' 0.97 $true))
+        $c.Count | Should -Be 0
+    }
+
+    It 'tracks CVE-less findings by their title' {
+        $prev = @(New-Row $null 'P3' 0 $false 1 'TLS 1.0 Protocol Enabled')
+        $curr = @(New-Row $null 'P2' 0 $false 1 'TLS 1.0 Protocol Enabled')
+        $c = @(Compare-TriageRun -Previous $prev -Current $curr)
+        $c.Count     | Should -Be 1
+        $c[0].Change | Should -Be 'Escalated'
+    }
+
+    It 'sorts newly-KEV items ahead of everything else' {
+        $prev = @((New-Row 'CVE-A' 'P3' 0.01), (New-Row 'CVE-B' 'P2' 0.02))
+        $curr = @((New-Row 'CVE-A' 'P1' 0.01 $true), (New-Row 'CVE-B' 'P1-Watch' 0.60))
+        (@(Compare-TriageRun -Previous $prev -Current $curr))[0].Cve | Should -Be 'CVE-A'
+    }
+
+    It 'handles both runs being empty' {
+        @(Compare-TriageRun -Previous @() -Current @()).Count | Should -Be 0
+    }
+}
+
 Describe 'Get-TriageSummary' {
     BeforeAll {
         $findings = @(Import-Csv -LiteralPath $script:SampleCsv)

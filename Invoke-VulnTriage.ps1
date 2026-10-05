@@ -26,6 +26,13 @@
 .PARAMETER EpssPath
     Use a local EPSS JSON file instead of querying FIRST.org.
 
+.PARAMETER CompareWith
+    Previous triage_summary_*.csv to diff this run against. Use 'latest' to pick
+    the most recent one already in -OutDir.
+
+.PARAMETER EpssDelta
+    Absolute EPSS rise between runs that counts as a spike worth reporting.
+
 .PARAMETER DryRun
     Print the summary to the console without writing any files.
 
@@ -34,6 +41,9 @@
 
 .EXAMPLE
     .\Invoke-VulnTriage.ps1 -InputCsv .\export.csv -OutDir .\output -EpssThreshold 0.3
+
+.EXAMPLE
+    .\Invoke-VulnTriage.ps1 -InputCsv .\export.csv -CompareWith latest
 #>
 [CmdletBinding()]
 param(
@@ -46,6 +56,8 @@ param(
     [string[]]$EscalateSeverity = @('Critical', 'High'),
     [string]$KevPath,
     [string]$EpssPath,
+    [string]$CompareWith,
+    [ValidateRange(0.0, 1.0)][double]$EpssDelta = 0.1,
     [switch]$DryRun
 )
 
@@ -95,6 +107,51 @@ Write-Host "`nTop priorities:" -ForegroundColor Cyan
 $summary | Select-Object -First 10 Priority, Cve, Severity, MaxEpssScore, AssetCount, OnCisaKev |
     Format-Table -AutoSize | Out-String | Write-Host
 
+# ---- Trend: what moved since the last run ----
+$changes = $null
+if ($CompareWith) {
+    $prevPath = if ($CompareWith -ieq 'latest') {
+        Get-ChildItem -LiteralPath $OutDir -Filter 'triage_summary_*.csv' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    } else {
+        $CompareWith
+    }
+
+    if (-not $prevPath) {
+        Write-Warning "No previous triage_summary_*.csv found in '$OutDir' — skipping trend comparison."
+    } elseif (-not (Test-Path -LiteralPath $prevPath -PathType Leaf)) {
+        Write-Warning "Comparison file '$prevPath' not found — skipping trend comparison."
+    } else {
+        Write-Host "Comparing against $(Split-Path $prevPath -Leaf)..." -ForegroundColor Cyan
+        $previous = @(Import-Csv -LiteralPath $prevPath)
+        $changes  = @(Compare-TriageRun -Previous $previous -Current $summary -EpssDelta $EpssDelta)
+
+        if ($changes.Count -eq 0) {
+            Write-Host "  No changes since the last run.`n" -ForegroundColor Green
+        } else {
+            $newlyKev = @($changes | Where-Object NewlyKev)
+            if ($newlyKev.Count) {
+                Write-Host "`n  ** $($newlyKev.Count) vulnerability(ies) newly added to CISA KEV **" -ForegroundColor Red
+                foreach ($k in $newlyKev) {
+                    Write-Host ("     {0}  {1} -> {2}" -f $k.Cve, $k.PreviousPriority, $k.CurrentPriority) -ForegroundColor Red
+                }
+            }
+
+            Write-Host "`n  Change summary:" -ForegroundColor Cyan
+            foreach ($g in $changes | Group-Object Change | Sort-Object Name) {
+                $color = switch ($g.Name) {
+                    'Escalated' { 'Red' } 'New' { 'Yellow' } 'Resolved' { 'Green' } default { 'Gray' }
+                }
+                Write-Host ("    {0,-13} {1}" -f $g.Name, $g.Count) -ForegroundColor $color
+            }
+
+            Write-Host "`n  Most significant:" -ForegroundColor Cyan
+            $changes | Select-Object -First 10 Change, Cve, PreviousPriority, CurrentPriority, AssetDelta, Detail |
+                Format-Table -AutoSize | Out-String | Write-Host
+        }
+    }
+}
+
 if ($DryRun) { Write-Host "Dry run — no files written.`n" -ForegroundColor Yellow; exit 0 }
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -107,4 +164,11 @@ $summary | Export-Csv -LiteralPath $sumPath    -NoTypeInformation -Encoding UTF8
 
 Write-Host "Wrote:" -ForegroundColor Green
 Write-Host "  $detailPath"
-Write-Host "  $sumPath`n"
+Write-Host "  $sumPath"
+
+if ($changes -and $changes.Count) {
+    $changePath = Join-Path $OutDir "triage_changes_$stamp.csv"
+    $changes | Export-Csv -LiteralPath $changePath -NoTypeInformation -Encoding UTF8
+    Write-Host "  $changePath"
+}
+Write-Host ""

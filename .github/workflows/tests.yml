@@ -34,3 +34,18 @@ jobs:
           ./Invoke-VulnTriage.ps1 -InputCsv ./samples/sample-findings.csv `
             -KevPath ./tests/fixtures/kev-sample.json `
             -EpssPath ./tests/fixtures/epss-sample.json -DryRun
+
+      - name: Smoke-test the trend diff
+        shell: pwsh
+        run: |
+          $common = @{
+            InputCsv = './samples/sample-findings.csv'
+            KevPath  = './tests/fixtures/kev-sample.json'
+            EpssPath = './tests/fixtures/epss-sample.json'
+            OutDir   = './ci-output'
+          }
+          ./Invoke-VulnTriage.ps1 @common
+          ./Invoke-VulnTriage.ps1 @common -CompareWith latest
+          if (-not (Get-ChildItem ./ci-output -Filter 'triage_summary_*.csv')) {
+            throw 'Expected summary output was not written.'
+          }

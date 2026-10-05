@@ -1,5 +1,6 @@
 # Generated output
 output/
+ci-output/
 *.csv
 !samples/*.csv
 !tests/fixtures/*.csv

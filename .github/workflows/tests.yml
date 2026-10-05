@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pester:
+    name: Pester (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $r = Invoke-Pester -Path ./tests -Output Detailed -PassThru
+          if ($r.FailedCount -gt 0) { throw "$($r.FailedCount) test(s) failed." }
+
+      - name: Smoke-test the CLI offline
+        shell: pwsh
+        run: |
+          ./Invoke-VulnTriage.ps1 -InputCsv ./samples/sample-findings.csv `
+            -KevPath ./tests/fixtures/kev-sample.json `
+            -EpssPath ./tests/fixtures/epss-sample.json -DryRun

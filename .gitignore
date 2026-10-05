@@ -1,0 +1,26 @@
+# Generated output
+output/
+*.csv
+!samples/*.csv
+!tests/fixtures/*.csv
+
+# Locally cached feed data
+kev.json
+epss.json
+
+# Never commit real scanner exports — they describe live weaknesses
+export*.csv
+findings*.csv
+scan*.csv
+
+# Secrets
+.env
+*.key
+*.local.*
+config/*.local.*
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+*.log

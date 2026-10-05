@@ -1,0 +1,11 @@
+hostname,plugin_name,cve_ids,risk_factor
+web-01,Apache Log4j2 RCE,"CVE-2021-44228, CVE-2021-45046",Critical
+web-02,Apache Log4j2 RCE,"CVE-2021-44228, CVE-2021-45046",Critical
+app-01,Microsoft SMBv1 RCE,CVE-2017-0144,Critical
+file-01,Microsoft SMBv1 RCE,CVE-2017-0144,Critical
+jump-01,Remote Desktop Services RCE,CVE-2019-0708,Critical
+lb-01,OpenSSL Heartbeat Information Disclosure,CVE-2014-0160,High
+lb-02,OpenSSL Heartbeat Information Disclosure,CVE-2014-0160,High
+api-01,OpenSSL X.509 Punycode Buffer Overflow,CVE-2022-3786,High
+db-01,TLS 1.0 Protocol Enabled,,Medium
+db-02,Unquoted Service Path,,Low
